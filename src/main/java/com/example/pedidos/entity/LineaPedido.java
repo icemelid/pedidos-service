@@ -1,7 +1,9 @@
+package com.example.pedidos.entity;
+
 import java.math.BigDecimal;
 import jakarta.persistence.*;
 
-Entity
+@Entity
 @Table(name = "lineas_pedido")
 public class LineaPedido {
 

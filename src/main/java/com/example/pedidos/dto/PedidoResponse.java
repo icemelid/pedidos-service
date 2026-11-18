@@ -1,3 +1,6 @@
+package com.example.pedidos.dto;
+
+import com.example.pedidos.entity.EstadoPedido;
 import java.time.LocalDateTime;
 import java.math.BigDecimal;
 
