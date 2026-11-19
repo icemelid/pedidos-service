@@ -15,6 +15,16 @@ import com.example.pedidos.entity.EstadoPedido;
 import com.example.pedidos.entity.Pedido;
 import com.example.pedidos.repository.PedidoRepository;
 
+import org.springframework.beans.factory.annotation.Qualifier;
+
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+import jakarta.annotation.PreDestroy;
+
 @Service
 public class PedidoService {
 
@@ -25,9 +35,12 @@ public class PedidoService {
     private final ProveedorClient proveedorClient;
     private final TransactionTemplate transactionTemplate;
 
+    private final ExecutorService executor =
+        Executors.newFixedThreadPool(5);
+
     public PedidoService(
             PedidoRepository pedidoRepository,
-            ProveedorClient proveedorClient,
+            @Qualifier("proveedorClientLentoSimulado") ProveedorClient proveedorClient,
             PlatformTransactionManager transactionManager) {
 
         this.pedidoRepository = pedidoRepository;
@@ -73,9 +86,17 @@ public class PedidoService {
 
                 pedido.setCosteEnvio(costeEnvio);
 
+                /*
                 pedido.setImporteTotal(
                         pedido.getImporteProductos().add(costeEnvio)
                 );
+                */
+                pedido.setImporteTotal(
+                        calcularImporteTotal(
+                                pedido.getImporteProductos(),
+                                costeEnvio
+                        )
+                );               
 
                 pedido.setEstado(EstadoPedido.CONFIRMED);
 
@@ -110,74 +131,134 @@ public class PedidoService {
         }
     }
 
-    public boolean reservarConfirmacion(Long pedidoId) {
+        public boolean reservarConfirmacion(Long pedidoId) {
 
-        Integer actualizados = transactionTemplate.execute(status ->
-                pedidoRepository.actualizarEstadoSiCoincide(
-                        pedidoId,
-                        EstadoPedido.CREATED,
-                        EstadoPedido.CONFIRMING
-                )
-        );
-
-        return actualizados != null && actualizados == 1;
-    }
-
-    private BigDecimal calcularCosteEnvioConReintentos(Long pedidoId) {
-
-        RuntimeException ultimoError = null;
-
-        for (int intento = 1; intento <= MAX_INTENTOS; intento++) {
-
-            try {
-                Pedido pedido = pedidoRepository.findById(pedidoId)
-                        .orElseThrow(() ->
-                                new IllegalStateException(
-                                        "No se encuentra el pedido."
-                                )
-                        );
-
-                return proveedorClient.calcularCosteEnvio(
-                        pedidoId,
-                        pedido.getImporteProductos()
+                Integer actualizados = transactionTemplate.execute(status ->
+                        pedidoRepository.actualizarEstadoSiCoincide(
+                                pedidoId,
+                                EstadoPedido.CREATED,
+                                EstadoPedido.CONFIRMING
+                        )
                 );
 
-            } catch (RuntimeException ex) {
-
-                ultimoError = ex;
-
-                if (intento < MAX_INTENTOS) {
-                    try {
-                        Thread.sleep(ESPERA_REINTENTO_MS);
-                    } catch (InterruptedException interrupted) {
-                        Thread.currentThread().interrupt();
-                        throw new IllegalStateException(
-                                "Se interrumpió la espera del reintento.",
-                                interrupted
-                        );
-                    }
-                }
-            }
+                return actualizados != null && actualizados == 1;
         }
 
-        throw new IllegalStateException(
-                "El proveedor no ha podido confirmar el pedido.",
-                ultimoError
-        );
-    }
+        private BigDecimal calcularCosteEnvioConReintentos(Long pedidoId) {
 
-    private PedidoResponse convertirAResponse(Pedido pedido) {
+                RuntimeException ultimoError = null;
 
-        PedidoResponse response = new PedidoResponse();
+                for (int intento = 1; intento <= MAX_INTENTOS; intento++) {
 
-        response.setId(pedido.getId());
-        response.setClienteId(pedido.getCliente().getId());
-        response.setEstado(pedido.getEstado());
-        response.setFecha(pedido.getFecha());
-        response.setImporteProductos(pedido.getImporteProductos());
-        response.setCosteEnvio(pedido.getCosteEnvio());
-        response.setImporteTotal(pedido.getImporteTotal());
+                try {
+                        Pedido pedido = pedidoRepository.findById(pedidoId)
+                                .orElseThrow(() ->
+                                        new IllegalStateException(
+                                                "No se encuentra el pedido."
+                                        )
+                                );
 
-        return response;
-    }
+                        /*
+                        return proveedorClient.calcularCosteEnvio(
+                                pedidoId,
+                                pedido.getImporteProductos()
+                        );
+                        */
+                        return calcularCosteEnvioConTimeout(
+                                pedidoId, 
+                                pedido.getImporteProductos()
+                        );               
+
+                } catch (RuntimeException ex) {
+
+                        ultimoError = ex;
+
+                        if (intento < MAX_INTENTOS) {
+                        try {
+                                Thread.sleep(ESPERA_REINTENTO_MS);
+                        } catch (InterruptedException interrupted) {
+                                Thread.currentThread().interrupt();
+                                throw new IllegalStateException(
+                                        "Se interrumpió la espera del reintento.",
+                                        interrupted
+                                );
+                        }
+                        }
+                }
+                }
+
+                throw new IllegalStateException(
+                        "El proveedor no ha podido confirmar el pedido.",
+                        ultimoError
+                );
+        }
+
+        private BigDecimal calcularCosteEnvioConTimeout(
+                Long pedidoId,
+                BigDecimal importeProductos) {
+
+                Future<BigDecimal> future = executor.submit(() ->
+                        proveedorClient.calcularCosteEnvio(
+                        pedidoId, importeProductos
+                        )
+                );
+
+                try {
+                        return future.get(6, TimeUnit.SECONDS);
+
+                } catch (TimeoutException ex) {
+                        future.cancel(true);
+
+                        throw new IllegalStateException(
+                        "Timeout: el proveedor ha superado los 6 segundos.", ex
+                        );
+
+                } catch (ExecutionException ex) {
+                        Throwable causa = ex.getCause();
+
+                        if (causa instanceof RuntimeException runtimeException) {
+                        throw runtimeException;
+                        }
+
+                        throw new IllegalStateException(
+                        "Error inesperado del proveedor.", causa
+                        );
+
+                } catch (InterruptedException ex) {
+                        future.cancel(true);
+                        Thread.currentThread().interrupt();
+
+                        throw new IllegalStateException(
+                        "Se interrumpió la espera del proveedor.", ex
+                        );
+                }
+        }
+
+        BigDecimal calcularImporteTotal(
+                BigDecimal importeProductos,
+                BigDecimal costeEnvio) {
+
+        return importeProductos.add(costeEnvio);
+        }
+
+        private PedidoResponse convertirAResponse(Pedido pedido) {
+
+                PedidoResponse response = new PedidoResponse();
+
+                response.setId(pedido.getId());
+                response.setClienteId(pedido.getCliente().getId());
+                response.setEstado(pedido.getEstado());
+                response.setFecha(pedido.getFecha());
+                response.setImporteProductos(pedido.getImporteProductos());
+                response.setCosteEnvio(pedido.getCosteEnvio());
+                response.setImporteTotal(pedido.getImporteTotal());
+
+                return response;
+        }
+
+        @PreDestroy
+        public void cerrarExecutor() {
+                executor.shutdownNow();
+        }  
+
 }
